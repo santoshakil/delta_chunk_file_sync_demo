@@ -1,3 +1,4 @@
+use md5;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,10 @@ fn main() -> NotifyResult<()> {
             Ok(event) => {
                 println!("{:?}", event);
                 // Handle event here
-                sync_files(&conn, source, destination);
+                if let Some(path) = event.paths.get(0) {
+                    sync_files(&conn, path, source, destination)
+                        .unwrap_or_else(|e| eprintln!("Sync error: {:?}", e));
+                }
             }
             Err(e) => println!("watch error: {:?}", e),
         }
@@ -55,56 +59,12 @@ fn init_db(conn: &Connection) {
     .unwrap();
 }
 
-fn sync_files(conn: &Connection, source: &str, destination: &str) {
-    let source_path = Path::new(source);
-    let dest_path = Path::new(destination);
-
-    // Sync source to destination
-    sync_directory(conn, source_path, dest_path);
-    // Sync destination to source
-    sync_directory(conn, dest_path, source_path);
-}
-
-fn sync_directory(conn: &Connection, source: &Path, dest: &Path) {
-    for entry in fs::read_dir(source).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.is_file() {
-            let metadata = fs::metadata(&path).unwrap();
-            let modified = metadata.modified().unwrap().elapsed().unwrap().as_secs();
-            let content = fs::read_to_string(&path).unwrap();
-            let hash = format!("{:x}", md5::compute(&content));
-
-            let file_metadata = FileMetadata {
-                path: path.to_str().unwrap().to_string(),
-                hash: hash.clone(),
-                modified,
-            };
-
-            let stored_metadata: Option<FileMetadata> = get_metadata(conn, &file_metadata.path);
-
-            if let Some(stored) = stored_metadata {
-                if stored.hash != hash {
-                    fs::write(&path, content.clone()).unwrap();
-                    store_metadata(conn, &file_metadata);
-                    let dest_path = path.strip_prefix(source).unwrap().join(dest);
-                    fs::write(dest_path, content).unwrap();
-                }
-            } else {
-                store_metadata(conn, &file_metadata);
-                let dest_path = path.strip_prefix(source).unwrap().join(dest);
-                fs::write(dest_path, content).unwrap();
-            }
-        }
-    }
-}
-
-fn store_metadata(conn: &Connection, metadata: &FileMetadata) {
+fn store_metadata(conn: &Connection, metadata: &FileMetadata) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO file_metadata (path, hash, modified) VALUES (?1, ?2, ?3)",
         params![metadata.path, metadata.hash, metadata.modified],
-    )
-    .unwrap();
+    )?;
+    Ok(())
 }
 
 fn get_metadata(conn: &Connection, path: &str) -> Option<FileMetadata> {
@@ -121,4 +81,61 @@ fn get_metadata(conn: &Connection, path: &str) -> Option<FileMetadata> {
     )
     .optional()
     .unwrap()
+}
+
+fn sync_files(
+    conn: &Connection,
+    path: &Path,
+    source: &str,
+    destination: &str,
+) -> std::io::Result<()> {
+    let source_path = Path::new(source);
+    let dest_path = Path::new(destination);
+
+    if path.starts_with(source_path) {
+        sync_single_file(conn, path, source_path, dest_path)
+    } else if path.starts_with(dest_path) {
+        sync_single_file(conn, path, dest_path, source_path)
+    } else {
+        Ok(())
+    }
+}
+
+fn sync_single_file(
+    conn: &Connection,
+    path: &Path,
+    source: &Path,
+    dest: &Path,
+) -> std::io::Result<()> {
+    if let Ok(metadata) = fs::metadata(path) {
+        let modified = metadata.modified()?.elapsed().unwrap_or_default().as_secs();
+        let content = fs::read_to_string(path)?;
+        let hash = format!("{:x}", md5::compute(&content));
+
+        let relative_path = path
+            .strip_prefix(source)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let dest_path = dest.join(relative_path);
+
+        let file_metadata = FileMetadata {
+            path: path.to_str().unwrap().to_string(),
+            hash: hash.clone(),
+            modified,
+        };
+
+        let stored_metadata = get_metadata(conn, &file_metadata.path);
+
+        if let Some(stored) = stored_metadata {
+            if stored.hash != hash {
+                fs::write(&dest_path, &content)?;
+                store_metadata(conn, &file_metadata)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+        } else {
+            fs::write(&dest_path, &content)?;
+            store_metadata(conn, &file_metadata)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+    }
+    Ok(())
 }
