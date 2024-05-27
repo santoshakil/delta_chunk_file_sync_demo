@@ -1,9 +1,11 @@
 use md5;
-use notify::{Config, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
+use notify::{
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -19,24 +21,22 @@ fn main() -> NotifyResult<()> {
         eprintln!("Usage: {} <source> <destination>", args[0]);
         return Ok(());
     }
-    let source = &args[1];
-    let destination = &args[2];
+    let source = std::fs::canonicalize(&args[1])?;
+    let destination = std::fs::canonicalize(&args[2])?;
 
     let conn = Connection::open("sync.db").unwrap();
     init_db(&conn);
 
     let (tx, rx) = channel();
     let mut watcher: RecommendedWatcher = Watcher::new(tx, Config::default())?;
-    watcher.watch(Path::new(source), RecursiveMode::Recursive)?;
-    watcher.watch(Path::new(destination), RecursiveMode::Recursive)?;
+    watcher.watch(&source, RecursiveMode::Recursive)?;
+    watcher.watch(&destination, RecursiveMode::Recursive)?;
 
     for res in rx {
         match res {
             Ok(event) => {
-                println!("{:?}", event);
-                // Handle event here
                 if let Some(path) = event.paths.get(0) {
-                    sync_files(&conn, path, source, destination)
+                    handle_event(&conn, &event, path, &source, &destination)
                         .unwrap_or_else(|e| eprintln!("Sync error: {:?}", e));
                 }
             }
@@ -83,11 +83,31 @@ fn get_metadata(conn: &Connection, path: &str) -> Option<FileMetadata> {
     .unwrap()
 }
 
+fn handle_event(
+    conn: &Connection,
+    event: &Event,
+    path: &Path,
+    source: &PathBuf,
+    destination: &PathBuf,
+) -> std::io::Result<()> {
+    match event.kind {
+        EventKind::Modify(_) | EventKind::Create(_) => {
+            sync_files(conn, path, source, destination)?;
+        }
+        EventKind::Remove(_) => {
+            // Handle file removal
+            remove_file(conn, path, source, destination)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn sync_files(
     conn: &Connection,
     path: &Path,
-    source: &str,
-    destination: &str,
+    source: &PathBuf,
+    destination: &PathBuf,
 ) -> std::io::Result<()> {
     let source_path = Path::new(source);
     let dest_path = Path::new(destination);
@@ -137,5 +157,42 @@ fn sync_single_file(
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
     }
+    Ok(())
+}
+
+fn remove_file(
+    conn: &Connection,
+    path: &Path,
+    source: &PathBuf,
+    destination: &PathBuf,
+) -> std::io::Result<()> {
+    let source_path = Path::new(source);
+    let dest_path = Path::new(destination);
+
+    if path.starts_with(source_path) {
+        let relative_path = path
+            .strip_prefix(source)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let dest_file_path = dest_path.join(relative_path);
+        if dest_file_path.exists() {
+            fs::remove_file(dest_file_path)?;
+        }
+    } else if path.starts_with(dest_path) {
+        let relative_path = path
+            .strip_prefix(dest_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let source_file_path = source_path.join(relative_path);
+        if source_file_path.exists() {
+            fs::remove_file(source_file_path)?;
+        }
+    }
+
+    let file_path = path.to_str().unwrap().to_string();
+    conn.execute(
+        "DELETE FROM file_metadata WHERE path = ?1",
+        params![file_path],
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
     Ok(())
 }
