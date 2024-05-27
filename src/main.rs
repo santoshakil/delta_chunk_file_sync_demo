@@ -4,9 +4,11 @@ use notify::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
+use std::{fs, io};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct FileMetadata {
@@ -120,41 +122,55 @@ fn sync_files(
     }
 }
 
-fn sync_single_file(
-    conn: &Connection,
-    path: &Path,
-    source: &Path,
-    dest: &Path,
-) -> std::io::Result<()> {
+const CHUNK_SIZE: usize = 8192; // Define chunk size (e.g., 8KB)
+
+fn sync_single_file(conn: &Connection, path: &Path, source: &Path, dest: &Path) -> io::Result<()> {
     if let Ok(metadata) = fs::metadata(path) {
         let modified = metadata.modified()?.elapsed().unwrap_or_default().as_secs();
-        let content = fs::read_to_string(path)?;
-        let hash = format!("{:x}", md5::compute(&content));
 
         let relative_path = path
             .strip_prefix(source)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let dest_path = dest.join(relative_path);
 
-        let file_metadata = FileMetadata {
+        let mut file_metadata = FileMetadata {
             path: path.to_str().unwrap().to_string(),
-            hash: hash.clone(),
+            hash: "".to_string(), // Placeholder for hash, we'll calculate in chunks
             modified,
         };
 
-        let stored_metadata = get_metadata(conn, &file_metadata.path);
+        let mut source_file = File::open(path)?;
+        let mut dest_file = File::create(&dest_path)?;
 
-        if let Some(stored) = stored_metadata {
-            if stored.hash != hash {
-                fs::write(&dest_path, &content)?;
-                store_metadata(conn, &file_metadata)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let stored_metadata = get_metadata(conn, &file_metadata.path);
+        let mut source_hasher = md5::Context::new();
+        let mut buffer = vec![0; CHUNK_SIZE];
+
+        loop {
+            let bytes_read = source_file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
             }
-        } else {
-            fs::write(&dest_path, &content)?;
-            store_metadata(conn, &file_metadata)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+            source_hasher.consume(&buffer[..bytes_read]);
+
+            if let Some(_) = &stored_metadata {
+                let mut dest_buffer = vec![0; CHUNK_SIZE];
+                if let Ok(_) = dest_file.read(&mut dest_buffer) {
+                    if buffer[..bytes_read] != dest_buffer[..bytes_read] {
+                        dest_file.write_all(&buffer[..bytes_read])?;
+                    }
+                } else {
+                    dest_file.write_all(&buffer[..bytes_read])?;
+                }
+            } else {
+                dest_file.write_all(&buffer[..bytes_read])?;
+            }
         }
+
+        file_metadata.hash = format!("{:x}", source_hasher.compute());
+        store_metadata(conn, &file_metadata)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
     Ok(())
 }
