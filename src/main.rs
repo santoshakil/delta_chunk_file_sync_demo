@@ -95,7 +95,6 @@ fn handle_event(
             sync_files(conn, path, source, destination)?;
         }
         EventKind::Remove(_) => {
-            // Handle file removal
             remove_file(conn, path, source, destination)?;
         }
         _ => {}
