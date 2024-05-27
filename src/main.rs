@@ -4,10 +4,12 @@ use notify::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::{fs, io};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -29,6 +31,7 @@ fn main() -> NotifyResult<()> {
     let conn = Connection::open("sync.db").unwrap();
     init_db(&conn);
 
+    let recently_synced = Arc::new(Mutex::new(HashSet::new()));
     let (tx, rx) = channel();
     let mut watcher: RecommendedWatcher = Watcher::new(tx, Config::default())?;
     watcher.watch(&source, RecursiveMode::Recursive)?;
@@ -38,7 +41,8 @@ fn main() -> NotifyResult<()> {
         match res {
             Ok(event) => {
                 if let Some(path) = event.paths.get(0) {
-                    handle_event(&conn, &event, path, &source, &destination)
+                    let recently_synced = Arc::clone(&recently_synced);
+                    handle_event(&conn, &event, path, &source, &destination, recently_synced)
                         .unwrap_or_else(|e| eprintln!("Sync error: {:?}", e));
                 }
             }
@@ -91,10 +95,18 @@ fn handle_event(
     path: &Path,
     source: &PathBuf,
     destination: &PathBuf,
+    recently_synced: Arc<Mutex<HashSet<PathBuf>>>,
 ) -> std::io::Result<()> {
+    let rs = recently_synced.clone();
+    let mut synced_paths = rs.lock().unwrap();
+    if synced_paths.contains(path) {
+        synced_paths.remove(path);
+        return Ok(());
+    }
+
     match event.kind {
         EventKind::Modify(_) | EventKind::Create(_) => {
-            sync_files(conn, path, source, destination)?;
+            sync_files(conn, path, source, destination, recently_synced)?;
         }
         EventKind::Remove(_) => {
             remove_file(conn, path, source, destination)?;
@@ -109,22 +121,29 @@ fn sync_files(
     path: &Path,
     source: &PathBuf,
     destination: &PathBuf,
+    recently_synced: Arc<Mutex<HashSet<PathBuf>>>,
 ) -> std::io::Result<()> {
     let source_path = Path::new(source);
     let dest_path = Path::new(destination);
 
     if path.starts_with(source_path) {
-        sync_single_file(conn, path, source_path, dest_path)
+        sync_single_file(conn, path, source_path, dest_path, recently_synced)
     } else if path.starts_with(dest_path) {
-        sync_single_file(conn, path, dest_path, source_path)
+        sync_single_file(conn, path, dest_path, source_path, recently_synced)
     } else {
         Ok(())
     }
 }
 
-const CHUNK_SIZE: usize = 8192; // Define chunk size (e.g., 8KB)
+const CHUNK_SIZE: usize = 1024 * 1024;
 
-fn sync_single_file(conn: &Connection, path: &Path, source: &Path, dest: &Path) -> io::Result<()> {
+fn sync_single_file(
+    conn: &Connection,
+    path: &Path,
+    source: &Path,
+    dest: &Path,
+    recently_synced: Arc<Mutex<HashSet<PathBuf>>>,
+) -> io::Result<()> {
     if let Ok(metadata) = fs::metadata(path) {
         let modified = metadata.modified()?.elapsed().unwrap_or_default().as_secs();
 
@@ -171,6 +190,9 @@ fn sync_single_file(conn: &Connection, path: &Path, source: &Path, dest: &Path) 
         file_metadata.hash = format!("{:x}", source_hasher.compute());
         store_metadata(conn, &file_metadata)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let mut synced_paths = recently_synced.lock().unwrap();
+        synced_paths.insert(dest_path);
     }
     Ok(())
 }
